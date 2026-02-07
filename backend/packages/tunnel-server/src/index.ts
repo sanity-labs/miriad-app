@@ -15,7 +15,6 @@
  */
 
 import { Hono } from 'hono';
-import { serve } from '@hono/node-server';
 import { verifyContainerToken, extractContainerToken } from './auth.js';
 import {
   initializeConfig,
@@ -28,6 +27,8 @@ import {
 } from './config.js';
 import { randomBytes } from 'node:crypto';
 import { createConnection } from 'node:net';
+import { createServer, type IncomingMessage } from 'node:http';
+import type { Duplex } from 'node:stream';
 
 const app = new Hono();
 
@@ -203,17 +204,49 @@ app.delete('/clients/:serviceId', async (c) => {
 // CloudWatch logs / direct ECS exec instead.
 
 // =============================================================================
-// Host-Based Routing Proxy
+// Host-Based Service Resolution
 // =============================================================================
 
 /**
- * Catch-all handler for user traffic.
- *
- * Extracts serviceId from Host header and proxies to rathole port.
+ * Resolve a Host header to a tunnel service entry.
  *
  * URL formats:
  * - {hash}.domain           -> serviceId = {hash} (default service)
  * - {serviceName}-{hash}.domain -> serviceId = {serviceName}-{hash} (named service)
+ *
+ * @returns service entry and serviceId, or error string
+ */
+function resolveService(host: string): { service: NonNullable<ReturnType<typeof getService>>; serviceId: string } | { error: string } {
+  const subdomainMatch = host.match(/^([a-z0-9-]+)\./);
+  if (!subdomainMatch) {
+    return { error: 'Invalid host format' };
+  }
+
+  const subdomain = subdomainMatch[1];
+  const serviceMatch = subdomain.match(/^(?:([a-z0-9]+)-)?([a-f0-9]{32,})$/);
+  if (!serviceMatch) {
+    return { error: 'Invalid tunnel URL format' };
+  }
+
+  const serviceName = serviceMatch[1];
+  const hash = serviceMatch[2];
+  const serviceId = serviceName ? `${serviceName}-${hash}` : hash;
+  const service = getService(serviceId);
+
+  if (!service) {
+    return { error: 'Tunnel not found' };
+  }
+
+  return { service, serviceId };
+}
+
+// =============================================================================
+// Host-Based Routing Proxy
+// =============================================================================
+
+/**
+ * Catch-all handler for user traffic (HTTP only — WebSocket upgrades
+ * are handled separately via the server 'upgrade' event).
  *
  * Note: This is a simple implementation. For production, consider using
  * a dedicated reverse proxy like nginx for better performance.
@@ -224,34 +257,12 @@ app.all('*', async (c) => {
     return c.json({ error: 'No Host header' }, 400);
   }
 
-  // Extract serviceId from subdomain
-  // Format: {serviceName}-{hash}.domain or {hash}.domain
-  // Hash is 32+ hex characters
-  const subdomainMatch = host.match(/^([a-z0-9-]+)\./);
-  if (!subdomainMatch) {
-    // Not a tunnel request, could be direct access to tunnel server
-    return c.json({ error: 'Invalid host format' }, 400);
+  const resolved = resolveService(host);
+  if ('error' in resolved) {
+    return c.json({ error: resolved.error }, resolved.error === 'Tunnel not found' ? 404 : 400);
   }
 
-  const subdomain = subdomainMatch[1];
-
-  // Parse subdomain to extract serviceId
-  // Try to match {serviceName}-{hash} first, then just {hash}
-  // Hash is 32+ hex chars at the end
-  const serviceMatch = subdomain.match(/^(?:([a-z0-9]+)-)?([a-f0-9]{32,})$/);
-  if (!serviceMatch) {
-    return c.json({ error: 'Invalid tunnel URL format' }, 400);
-  }
-
-  const serviceName = serviceMatch[1];  // undefined for default service
-  const hash = serviceMatch[2];
-  const serviceId = serviceName ? `${serviceName}-${hash}` : hash;
-
-  const service = getService(serviceId);
-
-  if (!service) {
-    return c.json({ error: 'Tunnel not found' }, 404);
-  }
+  const { service, serviceId } = resolved;
 
   // Proxy to rathole port
   const targetUrl = new URL(c.req.url);
@@ -313,7 +324,7 @@ app.all('*', async (c) => {
 });
 
 // =============================================================================
-// Server Startup
+// Server Startup (manual createServer for WebSocket upgrade support)
 // =============================================================================
 
 const port = parseInt(process.env.PORT || '8080', 10);
@@ -321,10 +332,107 @@ const port = parseInt(process.env.PORT || '8080', 10);
 console.log(`[TunnelServer] Starting on port ${port}`);
 console.log(`[TunnelServer] Rathole control port: ${process.env.RATHOLE_CONTROL_PORT || '2333'}`);
 
-// Start the server using @hono/node-server (not Bun default exports)
-serve({
-  fetch: app.fetch,
-  port,
-}, (info) => {
-  console.log(`[TunnelServer] Listening on http://localhost:${info.port}`);
+// Create HTTP server manually so we can handle 'upgrade' events for WebSocket
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url ?? '/', `http://localhost:${port}`);
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value) {
+      headers.set(key, Array.isArray(value) ? value[0] : value);
+    }
+  }
+
+  const fetchReq = new Request(url.toString(), {
+    method: req.method,
+    headers,
+    body: req.method !== 'GET' && req.method !== 'HEAD' ? req : undefined,
+    duplex: 'half',
+  } as RequestInit);
+
+  const response = await app.fetch(fetchReq);
+
+  res.statusCode = response.status;
+  response.headers.forEach((value, key) => {
+    res.setHeader(key, value);
+  });
+
+  if (response.body) {
+    const reader = response.body.getReader();
+    const pump = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(value);
+      }
+      res.end();
+    };
+    pump().catch((err) => {
+      console.error('[HTTP] Response stream error:', err);
+      res.end();
+    });
+  } else {
+    res.end();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// WebSocket Upgrade Handler
+// ---------------------------------------------------------------------------
+// Intercepts HTTP upgrade requests and pipes the raw TCP socket through to
+// the rathole port, allowing WebSocket connections to pass through the tunnel.
+
+server.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
+  const host = request.headers.host;
+  if (!host) {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  const resolved = resolveService(host);
+  if ('error' in resolved) {
+    const status = resolved.error === 'Tunnel not found' ? 404 : 400;
+    socket.write(`HTTP/1.1 ${status} ${resolved.error}\r\n\r\n`);
+    socket.destroy();
+    return;
+  }
+
+  const { service, serviceId } = resolved;
+  console.log(`[WS Proxy] Upgrading connection for ${serviceId} -> port ${service.port}`);
+
+  // Connect to the rathole port and pipe the upgrade through
+  const target = createConnection({ host: '127.0.0.1', port: service.port }, () => {
+    // Reconstruct the original HTTP upgrade request to send to the target
+    const path = request.url ?? '/';
+    let rawRequest = `${request.method} ${path} HTTP/1.1\r\n`;
+    // Forward all original headers
+    for (let i = 0; i < request.rawHeaders.length; i += 2) {
+      rawRequest += `${request.rawHeaders[i]}: ${request.rawHeaders[i + 1]}\r\n`;
+    }
+    rawRequest += '\r\n';
+
+    target.write(rawRequest);
+    if (head.length > 0) {
+      target.write(head);
+    }
+
+    // Bidirectional pipe
+    socket.pipe(target);
+    target.pipe(socket);
+  });
+
+  target.on('error', (err) => {
+    console.error(`[WS Proxy] Connection to port ${service.port} failed:`, err.message);
+    socket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    socket.destroy();
+  });
+
+  socket.on('error', (err) => {
+    console.error(`[WS Proxy] Client socket error:`, err.message);
+    target.destroy();
+  });
+});
+
+server.listen(port, () => {
+  console.log(`[TunnelServer] Listening on http://localhost:${port}`);
 });
