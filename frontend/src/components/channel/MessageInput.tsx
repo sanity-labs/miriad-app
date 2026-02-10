@@ -95,6 +95,33 @@ function clearMessageDraft(channelId: string): void {
   }
 }
 
+// Mention history for recency-based sorting
+const MENTION_HISTORY_KEY = 'miriad:mentionHistory'
+const MENTION_HISTORY_MAX = 20
+
+function getMentionHistory(channelId: string): string[] {
+  try {
+    const all = JSON.parse(localStorage.getItem(MENTION_HISTORY_KEY) || '{}')
+    return all[channelId] || []
+  } catch {
+    return []
+  }
+}
+
+function pushMentionHistory(channelId: string, callsign: string): void {
+  if (callsign === 'channel') return
+  try {
+    const all = JSON.parse(localStorage.getItem(MENTION_HISTORY_KEY) || '{}')
+    const history: string[] = all[channelId] || []
+    // Dedupe: remove previous occurrence, push to front, cap at max
+    const updated = [callsign, ...history.filter(h => h !== callsign)].slice(0, MENTION_HISTORY_MAX)
+    all[channelId] = updated
+    localStorage.setItem(MENTION_HISTORY_KEY, JSON.stringify(all))
+  } catch {
+    // Ignore storage errors
+  }
+}
+
 // Slash commands configuration
 const SLASH_COMMANDS = [
   { name: 'summon', description: 'Summon an agent to the channel', icon: Plus },
@@ -133,6 +160,11 @@ export function MessageInput({
   const [agentPickerIndex, setAgentPickerIndex] = useState(0)
   const [agentActionLoading, setAgentActionLoading] = useState(false)
 
+  // Send-mode: autocomplete is open because user pressed Enter without @mention
+  const [sendModePending, setSendModePending] = useState(false)
+  // Bump to force mentionHistory re-read from localStorage after sending
+  const [mentionHistoryVersion, setMentionHistoryVersion] = useState(0)
+
   // Loading state for resume actions in dormant dialog
   const [dormantActionLoading, setDormantActionLoading] = useState<string | null>(null)
   // Loading state for re-summon actions for dismissed agents
@@ -143,7 +175,11 @@ export function MessageInput({
   const [isDragOver, setIsDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const { findMentionTrigger, getOptionsCount, getOptionAtIndex } = useMentionAutocomplete(roster)
+  // Load mention history for recency-based sorting (re-reads on channel switch or after send)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const mentionHistory = useMemo(() => channelId ? getMentionHistory(channelId) : [], [channelId, mentionHistoryVersion])
+
+  const { findMentionTrigger, getOptionsCount, getOptionAtIndex } = useMentionAutocomplete(roster, mentionHistory)
 
   // Track previous channelId to save draft before switching
   const prevChannelIdRef = useRef<string | undefined>(channelId)
@@ -203,15 +239,20 @@ export function MessageInput({
     return agents.filter(a => a.callsign.toLowerCase().includes(query.toLowerCase()))
   }, [pausableAgents, resumableAgents])
 
-  // Extract leading @mentions from content for sticky behavior
-  const extractLeadingMentions = useCallback((text: string): string => {
-    const match = text.match(/^(@\w+\s*)+/)
-    return match ? match[0] : ''
+  // Extract the last @mention from content (for auto-mention after send)
+  const extractLastMention = useCallback((text: string): string => {
+    const mentions = text.match(/@([\w-]+)/g)
+    if (!mentions) return ''
+    // Find the last mention that isn't @channel
+    for (let i = mentions.length - 1; i >= 0; i--) {
+      if (mentions[i] !== '@channel') return mentions[i] + ' '
+    }
+    return ''
   }, [])
 
   // Extract @mentions from content
   const mentionedCallsigns = useMemo(() => {
-    const mentionRegex = /@(\w+)/g
+    const mentionRegex = /@([\w-]+)/g
     const mentions: string[] = []
     let match
     while ((match = mentionRegex.exec(content)) !== null) {
@@ -481,25 +522,67 @@ export function MessageInput({
     // Need either text or files to send
     if (!trimmed && validFiles.length === 0) return
 
-    // Extract leading mentions for sticky behavior
-    const leadingMentions = extractLeadingMentions(trimmed)
+    // File-only send — no mention required
+    if (!trimmed && validFiles.length > 0) {
+      onSend('', validFiles)
+      clearFiles()
+      if (channelId) clearMessageDraft(channelId)
+      return
+    }
+
+    // If no @mention in the message, open the agent picker instead of sending
+    const hasMention = /@[\w-]+/.test(trimmed)
+    if (!hasMention) {
+      setSendModePending(true)
+      setAutocompleteQuery('')
+      setSelectedIndex(0)
+      setShowAutocomplete(true)
+      return
+    }
+
+    // Extract last @mention for auto-mention after send + track recency
+    const lastMention = extractLastMention(trimmed)
+    if (channelId && lastMention) {
+      // lastMention is '@agent ', extract the callsign
+      const callsign = lastMention.trim().slice(1)
+      pushMentionHistory(channelId, callsign)
+      setMentionHistoryVersion(v => v + 1)
+    }
 
     onSend(trimmed, validFiles.length > 0 ? validFiles : undefined)
-    setContent(leadingMentions) // Pre-populate with sticky mentions
+    setContent(lastMention)
     setShowAutocomplete(false)
     setShowSlashMenu(false)
     clearFiles()
 
-    // Clear or update draft after sending
+    // Clear draft after sending
     if (channelId) {
-      if (leadingMentions) {
-        // Save sticky mentions as the new draft
-        saveMessageDraft(channelId, { content: leadingMentions, cursorPosition: leadingMentions.length })
-      } else {
-        clearMessageDraft(channelId)
-      }
+      clearMessageDraft(channelId)
     }
-  }, [content, stagedFiles, onSend, extractLeadingMentions, channelId, clearFiles])
+  }, [content, stagedFiles, onSend, extractLastMention, channelId, clearFiles])
+
+  // Send-mode select: prepend @agent to message and send immediately
+  const handleSendModeSelect = useCallback((mention: string) => {
+    const trimmed = content.trim()
+    const validFiles = stagedFiles.filter(f => !f.error).map(f => f.file)
+    const messageWithMention = `@${mention} ${trimmed}`
+
+    if (channelId) {
+      pushMentionHistory(channelId, mention)
+      setMentionHistoryVersion(v => v + 1)
+    }
+
+    onSend(messageWithMention, validFiles.length > 0 ? validFiles : undefined)
+    setContent(mention === 'channel' ? '' : `@${mention} `) // Sticky pre-fill (skip @channel)
+    setSendModePending(false)
+    setShowAutocomplete(false)
+    setShowSlashMenu(false)
+    clearFiles()
+
+    if (channelId) {
+      clearMessageDraft(channelId)
+    }
+  }, [content, stagedFiles, onSend, channelId, clearFiles])
 
   // Insert mention at the trigger position
   const insertMention = useCallback((mention: string) => {
@@ -598,12 +681,17 @@ export function MessageInput({
           e.preventDefault()
           const selected = getOptionAtIndex(autocompleteQuery, selectedIndex)
           if (selected) {
-            insertMention(selected)
+            if (sendModePending) {
+              handleSendModeSelect(selected)
+            } else {
+              insertMention(selected)
+            }
           }
           return
         }
         if (e.key === 'Escape') {
           e.preventDefault()
+          setSendModePending(false)
           setShowAutocomplete(false)
           return
         }
@@ -619,7 +707,7 @@ export function MessageInput({
       showAgentPicker, agentPickerQuery, agentPickerIndex, getFilteredPickerAgents, handleAgentAction,
       showSlashMenu, filteredCommands, slashSelectedIndex, executeSlashCommand,
       showAutocomplete, autocompleteQuery, selectedIndex, getOptionsCount, getOptionAtIndex,
-      insertMention, handleSubmit
+      insertMention, handleSubmit, sendModePending, handleSendModeSelect
     ]
   )
 
@@ -742,11 +830,6 @@ export function MessageInput({
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [showSlashMenu])
 
-  // Calculate autocomplete position (above the textarea)
-  const getAutocompletePosition = () => {
-    return { top: 8, left: 16 }
-  }
-
   return (
     <div className="px-4 pt-0 pb-4 bg-card">
       <div className="relative">
@@ -807,10 +890,11 @@ export function MessageInput({
             query={autocompleteQuery}
             roster={roster}
             selectedIndex={selectedIndex}
-            onSelect={insertMention}
-            onClose={() => setShowAutocomplete(false)}
-            position={getAutocompletePosition()}
+            onSelect={sendModePending ? handleSendModeSelect : insertMention}
+            onClose={() => { setSendModePending(false); setShowAutocomplete(false) }}
             channelId={channelId}
+            mentionHistory={mentionHistory}
+            sendMode={sendModePending}
           />
         )}
 
