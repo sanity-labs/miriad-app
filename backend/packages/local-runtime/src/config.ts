@@ -2,7 +2,8 @@
  * Configuration Module
  *
  * Handles reading/writing runtime config from ~/.config/miriad/config.json
- * and API interactions for bootstrap exchange.
+ * (or MIRIAD_CONFIG_DIR/config.json if set) and API interactions for
+ * bootstrap exchange.
  */
 
 import { mkdir, readFile, writeFile, unlink } from 'node:fs/promises';
@@ -12,12 +13,8 @@ import { ulid } from 'ulid';
 import type { RuntimeConfig, BootstrapResponse, ParsedConnectionString } from './types.js';
 
 // =============================================================================
-// Configuration Paths
+// Path Helpers
 // =============================================================================
-
-const CONFIG_DIR = join(homedir(), '.config', 'miriad');
-const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
-const DEFAULT_WORKSPACE_BASE = join(homedir(), 'miriad-workspaces');
 
 /**
  * Expand tilde (~) to home directory in paths.
@@ -31,6 +28,16 @@ function expandTilde(path: string): string {
   }
   return path;
 }
+
+// =============================================================================
+// Configuration Paths
+// =============================================================================
+
+const CONFIG_DIR = process.env.MIRIAD_CONFIG_DIR
+  ? expandTilde(process.env.MIRIAD_CONFIG_DIR)
+  : join(homedir(), '.config', 'miriad');
+const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
+const DEFAULT_WORKSPACE_BASE = join(homedir(), 'miriad-workspaces');
 
 // =============================================================================
 // Environment Detection
@@ -120,7 +127,7 @@ function normalizeConfig(config: RuntimeConfig): RuntimeConfig {
  *
  * Config sources (in priority order):
  * 1. MIRIAD_CONFIG env var (JSON string) - for containerized deployments
- * 2. Config file at ~/.config/miriad/config.json - for local installs
+ * 2. Config file at $MIRIAD_CONFIG_DIR/config.json (or ~/.config/miriad/config.json)
  *
  * Returns null if no config found.
  */

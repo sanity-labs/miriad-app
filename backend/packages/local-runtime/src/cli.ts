@@ -55,6 +55,9 @@ Configuration:
 
 Environment Variables:
   ANTHROPIC_API_KEY    Required for Claude Agent SDK
+  MIRIAD_CONFIG_DIR    Override config directory (default: ~/.config/miriad)
+                       Useful for running dev and prod instances side by side:
+                       MIRIAD_CONFIG_DIR=~/.config/miriad-dev npx @miriad-systems/backend start
 `;
 
 // =============================================================================
