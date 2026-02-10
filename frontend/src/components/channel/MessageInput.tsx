@@ -203,10 +203,15 @@ export function MessageInput({
     return agents.filter(a => a.callsign.toLowerCase().includes(query.toLowerCase()))
   }, [pausableAgents, resumableAgents])
 
-  // Extract leading @mentions from content for sticky behavior
-  const extractLeadingMentions = useCallback((text: string): string => {
-    const match = text.match(/^(@\w+\s*)+/)
-    return match ? match[0] : ''
+  // Extract the last @mention from content (for auto-mention after send)
+  const extractLastMention = useCallback((text: string): string => {
+    const mentions = text.match(/@(\w+)/g)
+    if (!mentions) return ''
+    // Find the last mention that isn't @channel
+    for (let i = mentions.length - 1; i >= 0; i--) {
+      if (mentions[i] !== '@channel') return mentions[i] + ' '
+    }
+    return ''
   }, [])
 
   // Extract @mentions from content
@@ -481,25 +486,20 @@ export function MessageInput({
     // Need either text or files to send
     if (!trimmed && validFiles.length === 0) return
 
-    // Extract leading mentions for sticky behavior
-    const leadingMentions = extractLeadingMentions(trimmed)
+    // Extract last @mention for auto-mention after send
+    const lastMention = extractLastMention(trimmed)
 
     onSend(trimmed, validFiles.length > 0 ? validFiles : undefined)
-    setContent(leadingMentions) // Pre-populate with sticky mentions
+    setContent(lastMention)
     setShowAutocomplete(false)
     setShowSlashMenu(false)
     clearFiles()
 
-    // Clear or update draft after sending
+    // Clear draft after sending
     if (channelId) {
-      if (leadingMentions) {
-        // Save sticky mentions as the new draft
-        saveMessageDraft(channelId, { content: leadingMentions, cursorPosition: leadingMentions.length })
-      } else {
-        clearMessageDraft(channelId)
-      }
+      clearMessageDraft(channelId)
     }
-  }, [content, stagedFiles, onSend, extractLeadingMentions, channelId, clearFiles])
+  }, [content, stagedFiles, onSend, extractLastMention, channelId, clearFiles])
 
   // Insert mention at the trigger position
   const insertMention = useCallback((mention: string) => {
